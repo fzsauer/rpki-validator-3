@@ -27,48 +27,58 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-package net.ripe.rpki.validator3.domain;
+package net.ripe.rpki.validator3.util;
 
-import net.ripe.rpki.commons.crypto.CertificateRepositoryObject;
-import net.ripe.rpki.commons.crypto.cms.manifest.ManifestCms;
-import net.ripe.rpki.commons.validation.ValidationResult;
-import org.apache.commons.lang3.tuple.Pair;
-
-import javax.persistence.LockModeType;
-import java.time.Instant;
-import java.util.List;
+import java.util.HashMap;
 import java.util.Map;
-import java.util.Optional;
-import java.util.stream.Stream;
+import java.util.concurrent.Callable;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
-public interface RpkiObjects {
-    void add(RpkiObject rpkiObject);
+public class Locks {
+    public static void locked(Lock lock, Runnable s) {
+        lock.lock();
+        try {
+            s.run();
+        } finally {
+            lock.unlock();
+        }
+    }
 
-    void remove(RpkiObject o);
+    public static <T> T locked(Lock lock, Callable<T> c) {
+        lock.lock();
+        try {
+            try {
+                return c.call();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
 
-    Stream<Pair<CertificateTreeValidationRun, RpkiObject>> findCurrentlyValidated(RpkiObject.Type type);
+    private static ReentrantLock globalLock = new ReentrantLock();
+    private static Map<Object, ReentrantLock> perKeyLocks = new HashMap<>();
 
-    void merge(RpkiObject object);
-    
-    RpkiObject get(long id);
+    public static <T> T lockedPerKey(Object lockKey, Callable<T> c) {
+        final ReentrantLock perKeyLock = locked(globalLock, () ->
+                perKeyLocks.computeIfAbsent(lockKey, lk -> new ReentrantLock()));
+        try {
+            return locked(perKeyLock, c);
+        } finally {
+            locked(globalLock, () -> perKeyLocks.remove(lockKey));
+        }
+    }
 
-    <T extends CertificateRepositoryObject> Optional<T> findCertificateRepositoryObject(long rpkiObjectId, Class<T> clazz, ValidationResult validationResult);
+    public static void lockedPerKey(Object lockKey, Runnable r) {
+        final ReentrantLock perKeyLock = locked(globalLock, () ->
+                perKeyLocks.computeIfAbsent(lockKey, lk -> new ReentrantLock()));
+        try {
+            locked(perKeyLock, r);
+        } finally {
+            locked(globalLock, () -> perKeyLocks.remove(lockKey));
+        }
+    }
 
-    Optional<RpkiObject> findBySha256(byte[] sha256);
-
-    Map<String, RpkiObject> findObjectsInManifest(ManifestCms manifestCms, LockModeType lockMode);
-
-    Map<byte[], RpkiObject> findObjectsInManifest(Map<String, byte[]> manifestFiles);
-
-    Stream<RpkiObject> all();
-
-    Optional<RpkiObject> findLatestByTypeAndAuthorityKeyIdentifier(RpkiObject.Type type, byte[] authorityKeyIdentifier);
-
-    long deleteUnreachableObjects(Instant unreachableSince);
-
-    long clear();
-
-    Stream<byte[]> streamObjects(RpkiObject.Type type);
-
-    void deleteByHash(byte[] hashOfTheObjectToReplace);
 }

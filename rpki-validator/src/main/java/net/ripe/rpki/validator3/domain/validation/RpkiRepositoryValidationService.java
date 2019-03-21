@@ -46,13 +46,13 @@ import net.ripe.rpki.validator3.domain.TrustAnchor;
 import net.ripe.rpki.validator3.domain.ValidationRuns;
 import net.ripe.rpki.validator3.rrdp.RrdpService;
 import net.ripe.rpki.validator3.util.Hex;
+import net.ripe.rpki.validator3.util.Locks;
 import net.ripe.rpki.validator3.util.Rsync;
 import net.ripe.rpki.validator3.util.Sha256;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import javax.persistence.EntityManager;
@@ -73,6 +73,7 @@ import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -118,7 +119,7 @@ public class RpkiRepositoryValidationService {
 
         final String uri = rpkiRepository.getRrdpNotifyUri();
         if (isRrdpUri(uri)) {
-            rrdpService.storeRepository(rpkiRepository, validationRun);
+            Locks.lockedPerKey(collectInvolvedTaNames(rpkiRepository), () -> rrdpService.storeRepository(rpkiRepository, validationRun));
             if (validationRun.isFailed()) {
                 rpkiRepository.setFailed();
             } else {
@@ -141,6 +142,10 @@ public class RpkiRepositoryValidationService {
         }
     }
 
+    private static Set<String> collectInvolvedTaNames(RpkiRepository rpkiRepository) {
+        return rpkiRepository.getTrustAnchors().stream().map(TrustAnchor::getName).collect(Collectors.toSet());
+    }
+
     public void validateRsyncRepositories() {
         entityManager.setFlushMode(FlushModeType.COMMIT);
 
@@ -154,19 +159,21 @@ public class RpkiRepositoryValidationService {
         final Map<String, RpkiObject> objectsBySha256 = new HashMap<>();
         final Map<URI, RpkiRepository> fetchedLocations = new HashMap<>();
         ValidationResult results = rpkiRepositories.findRsyncRepositories()
-            .filter((repository) -> {
-                boolean needsUpdate = repository.isPending() || repository.getLastDownloadedAt() == null || repository.getLastDownloadedAt().isBefore(cutoffTime);
-                if (!needsUpdate) {
-                    fetchedLocations.put(URI.create(repository.getRsyncRepositoryUri()), repository);
-                }
-                return needsUpdate;
-            })
-            .map((repository) -> processRsyncRepository(affectedTrustAnchors, validationRun, fetchedLocations, objectsBySha256, repository))
-            .collect(
-                () -> ValidationResult.withLocation("placeholder"),
-                ValidationResult::addAll,
-                ValidationResult::addAll
-            );
+                .filter(repository -> {
+                    boolean needsUpdate = repository.isPending() || repository.getLastDownloadedAt() == null || repository.getLastDownloadedAt().isBefore(cutoffTime);
+                    if (!needsUpdate) {
+                        fetchedLocations.put(URI.create(repository.getRsyncRepositoryUri()), repository);
+                    }
+                    return needsUpdate;
+                })
+                .map(repository -> Locks.lockedPerKey(
+                        collectInvolvedTaNames(repository),
+                        () -> processRsyncRepository(affectedTrustAnchors, validationRun, fetchedLocations, objectsBySha256, repository)))
+                .collect(
+                        () -> ValidationResult.withLocation("placeholder"),
+                        ValidationResult::addAll,
+                        ValidationResult::addAll
+                );
 
         validationRun.completeWith(results);
         affectedTrustAnchors.forEach(ta -> {
@@ -177,7 +184,10 @@ public class RpkiRepositoryValidationService {
 
     public Set<TrustAnchor> prefetchRepository(RpkiRepository repository) {
         entityManager.setFlushMode(FlushModeType.COMMIT);
+        return Locks.lockedPerKey(collectInvolvedTaNames(repository), () -> prefetchRsyncRepository(repository));
+    }
 
+    private Set<TrustAnchor> prefetchRsyncRepository(RpkiRepository repository) {
         final Set<TrustAnchor> affectedTrustAnchors = new HashSet<>();
         if (repository.isPending() && repository.getType() == RpkiRepository.Type.RSYNC_PREFETCH) {
             log.info("Processing rsync-prefetch repository {}", repository);
@@ -282,7 +292,6 @@ public class RpkiRepositoryValidationService {
                 if (dir.equals(targetDirectory.toPath())) {
                     return FileVisitResult.CONTINUE;
                 }
-
                 log.trace("visiting {}", dir);
 
                 super.preVisitDirectory(dir, attrs);
@@ -320,20 +329,19 @@ public class RpkiRepositoryValidationService {
                     if (existing != null) {
                         existing.addLocation(validationResult.getCurrentLocation().getName());
                         return existing;
-                    } else {
-                        CertificateRepositoryObject obj = CertificateRepositoryObjectFactory.createCertificateRepositoryObject(content, validationResult);
-                        validationRun.addChecks(validationResult);
-
-                        if (validationResult.hasFailureForCurrentLocation()) {
-                            log.debug("parsing {} failed: {}", file, validationResult.getFailuresForCurrentLocation());
-                            return null;
-                        }
-
-                        RpkiObject object = new RpkiObject(validationResult.getCurrentLocation().getName(), obj);
-                        rpkiObjects.add(object);
-                        validationRun.addRpkiObject(object);
-                        return object;
                     }
+                    CertificateRepositoryObject obj = CertificateRepositoryObjectFactory.createCertificateRepositoryObject(content, validationResult);
+                    validationRun.addChecks(validationResult);
+
+                    if (validationResult.hasFailureForCurrentLocation()) {
+                        log.debug("parsing {} failed: {}", file, validationResult.getFailuresForCurrentLocation());
+                        return null;
+                    }
+
+                    RpkiObject object = new RpkiObject(validationResult.getCurrentLocation().getName(), obj);
+                    rpkiObjects.add(object);
+                    validationRun.addRpkiObject(object);
+                    return object;
                 });
 
                 return FileVisitResult.CONTINUE;

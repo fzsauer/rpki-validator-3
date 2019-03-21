@@ -55,7 +55,6 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 
@@ -201,13 +200,13 @@ public class RrdpService {
     @Transactional(Transactional.TxType.REQUIRED)
     void storeSnapshot(final Snapshot snapshot, final RpkiRepositoryValidationRun validationRun) {
         final AtomicInteger counter = new AtomicInteger();
-        snapshot.asMap().forEach((objUri, value) -> {
+        snapshot.asMap().forEach((location, value) -> {
             byte[] content = value.content;
             rpkiObjectRepository.findBySha256(Sha256.hash(content)).map(existing -> {
-                existing.addLocation(objUri);
+                existing.addLocation(location);
                 return existing;
             }).orElseGet(() -> {
-                final Either<ValidationResult, RpkiObject> maybeRpkiObject = createRpkiObject(objUri, content);
+                final Either<ValidationResult, RpkiObject> maybeRpkiObject = createRpkiObject(location, content);
                 if (maybeRpkiObject.isLeft()) {
                     validationRun.addChecks(maybeRpkiObject.left().value());
                     return null;
@@ -277,44 +276,46 @@ public class RrdpService {
     }
 
     private boolean applyDeltaPublish(RpkiRepositoryValidationRun validationRun, String uri, DeltaPublish deltaPublish) {
+        final byte[] content = deltaPublish.getContent();
+        final byte[] newSha256 = Sha256.hash(content);
+
         if (deltaPublish.getHash().isPresent()) {
-            final byte[] sha256 = deltaPublish.getHash().get();
-            final Optional<RpkiObject> existing = rpkiObjectRepository.findBySha256(sha256);
-            if (existing.isPresent()) {
-                return addRpkiObject(validationRun, uri, deltaPublish, sha256);
+            final byte[] hashOfTheObjectToReplace = deltaPublish.getHash().get();
+            final Optional<RpkiObject> objectToReplace = rpkiObjectRepository.findBySha256(hashOfTheObjectToReplace);
+            if (objectToReplace.isPresent()) {
+                final Either<ValidationResult, RpkiObject> maybeRpkiObject = createRpkiObject(uri, content);
+                if (maybeRpkiObject.isLeft()) {
+                    validationRun.addChecks(maybeRpkiObject.left().value());
+                } else {
+                    final RpkiObject object = maybeRpkiObject.right().value();
+                    if (Arrays.equals(object.getSha256(), hashOfTheObjectToReplace)) {
+                        log.info("The object added is the same {}, not doing anything", object);
+                    } else {
+                        rpkiObjectRepository.add(object);
+                        validationRun.addRpkiObject(object);
+                        rpkiObjectRepository.deleteByHash(hashOfTheObjectToReplace);
+                        return true;
+                    }
+                }
             } else {
                 ValidationCheck validationCheck = new ValidationCheck(validationRun, uri,
-                        ValidationCheck.Status.ERROR, ErrorCodes.RRDP_REPLACE_NONEXISTENT_OBJECT, Hex.format(sha256));
+                        ValidationCheck.Status.ERROR, ErrorCodes.RRDP_REPLACE_NONEXISTENT_OBJECT, Hex.format(hashOfTheObjectToReplace));
                 validationRun.addCheck(validationCheck);
-                return false;
             }
         } else {
-            return addRpkiObject(validationRun, uri, deltaPublish, null);
-        }
-    }
-
-    private boolean addRpkiObject(RpkiRepositoryValidationRun validationRun, String uri, DeltaPublish deltaPublish, final byte[] existingHash) {
-        final byte[] content = deltaPublish.getContent();
-        final Either<ValidationResult, RpkiObject> maybeRpkiObject = createRpkiObject(uri, content);
-        if (maybeRpkiObject.isLeft()) {
-            validationRun.addChecks(maybeRpkiObject.left().value());
-        } else {
-            final RpkiObject object = maybeRpkiObject.right().value();
-            if (existingHash == null) {
-                final Optional<RpkiObject> bySha256 = rpkiObjectRepository.findBySha256(Sha256.hash(content));
-                if (bySha256.isPresent()) {
-                    log.info("The object will not be added, there's one already existing {}", object);
+            final Optional<RpkiObject> bySha256 = rpkiObjectRepository.findBySha256(newSha256);
+            if (bySha256.isPresent()) {
+                log.info("The object will not be added, there's one already existing {}", bySha256.get());
+            } else {
+                final Either<ValidationResult, RpkiObject> maybeRpkiObject = createRpkiObject(uri, content);
+                if (maybeRpkiObject.isLeft()) {
+                    validationRun.addChecks(maybeRpkiObject.left().value());
                 } else {
+                    final RpkiObject object = maybeRpkiObject.right().value();
+                    rpkiObjectRepository.add(object);
                     validationRun.addRpkiObject(object);
-                    rpkiObjectRepository.merge(object);
                     return true;
                 }
-            } else if (!Arrays.equals(object.getSha256(), existingHash)) {
-                validationRun.addRpkiObject(object);
-                rpkiObjectRepository.merge(object);
-                return true;
-            } else {
-                log.info("The object added is the same {}", object);
             }
         }
         return false;
