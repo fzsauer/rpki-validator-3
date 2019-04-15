@@ -85,6 +85,7 @@ public class JPATrustAnchorRepositoryTest {
 
     @Test
     public void should_get_statuses() {
+        entityManager.clear();
         TrustAnchor trustAnchor = TestObjects.newTrustAnchor();
         entityManager.persist(trustAnchor);
 
